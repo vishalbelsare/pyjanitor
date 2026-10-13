@@ -23,19 +23,29 @@ def test_update_where(dataframe):
 
 @pytest.fixture
 def df():
-    return pd.DataFrame(
-        {"a": [1, 2, 3, 4], "b": [5, 6, 7, 8], "c": [0, 0, 0, 0]}
-    )
+    return pd.DataFrame({"a": [1, 2, 3, 4], "b": [5, 6, 7, 8], "c": [0, 0, 0, 0]})
 
 
 def test_update_where_query(df):
     """Test that function works with pandas query-style string expression."""
 
-    expected = pd.DataFrame(
-        {"a": [1, 2, 3, 4], "b": [5, 6, 7, 8], "c": [0, 0, 10, 0]}
-    )
+    expected = pd.DataFrame({"a": [1, 2, 3, 4], "b": [5, 6, 7, 8], "c": [0, 0, 10, 0]})
     result = update_where(
         df, conditions="a > 2 and b < 8", target_column_name="c", target_val=10
+    )
+
+    assert_frame_equal(result, expected)
+
+
+def test_update_where_expression(df):
+    """Test that function works with pandas expression."""
+
+    expected = pd.DataFrame({"a": [1, 2, 3, 4], "b": [5, 6, 7, 8], "c": [0, 0, 10, 0]})
+    result = update_where(
+        df,
+        conditions=(pd.col("a") > 2) & (pd.col("b") < 8),
+        target_column_name="c",
+        target_val=10,
     )
 
     assert_frame_equal(result, expected)

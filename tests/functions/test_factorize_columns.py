@@ -7,8 +7,11 @@ Because underneath the hood we are using `pd.factorize`,
 we intentionally do not test the values of the resultant dataframe.
 That would be duplicating the tests from what the `pandas` library provides.
 """
+
 import pandas as pd
 import pytest
+
+import janitor  # noqa: F401
 
 
 @pytest.mark.functions
@@ -26,9 +29,7 @@ def test_single_column_fail_factorize_columns():
     with pytest.raises(ValueError):
         pd.DataFrame(
             {"a": ["hello", "hello", "sup"], "b": [1, 2, 3]}
-        ).factorize_columns(
-            column_names="c"
-        )  # noqa: 841
+        ).factorize_columns(column_names="c")
 
 
 @pytest.mark.functions

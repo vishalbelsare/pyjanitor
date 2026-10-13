@@ -6,7 +6,6 @@ from pandas.testing import assert_frame_equal
 
 @pytest.mark.functions
 def test_groupby_agg():
-
     df = pd.DataFrame(
         {
             "date": [
@@ -25,7 +24,7 @@ def test_groupby_agg():
         by="date",
         new_column_name="date_average",
         agg_column_name="values",
-        agg=np.mean,
+        agg="mean",
     )
     assert df.shape[0] == df_new.shape[0]
     assert "date_average" in df_new.columns
@@ -34,7 +33,6 @@ def test_groupby_agg():
 
 @pytest.mark.functions
 def test_groupby_agg_multi():
-
     df = pd.DataFrame(
         {
             "date": [
@@ -113,9 +111,9 @@ def test_groupby_agg_null_columns(df):
     the right aggregated value.
     """
     expected = df.copy()
-    expected["num_count"] = expected.groupby(["nulls"], dropna=False)[
-        "type"
-    ].transform("size")
+    expected["num_count"] = expected.groupby(["nulls"], dropna=False)["type"].transform(
+        "size"
+    )
     assert_frame_equal(
         df.groupby_agg(
             by="nulls",

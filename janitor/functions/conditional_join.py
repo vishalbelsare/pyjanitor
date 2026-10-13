@@ -1,44 +1,104 @@
-from pandas.core.construction import extract_array
-from pandas.core.reshape.merge import _MergeOperation
+"""Public conditional-join API and dispatch coordinator.
+
+The public methods in this module intentionally describe pandas behavior and
+do not expose the implementation language used by the kernels.  Internally,
+the dispatcher normalizes both inputs to shallow working copies, validates
+the complete predicate list, resets indexes to physical row positions, and
+selects one specialized join family:
+
+* equality-led joins use the equi-key dispatcher;
+* all-``!=`` joins use the null-aware not-equal dispatcher;
+* one range predicate, optionally followed by residuals, uses the
+  single-range dispatcher;
+* two or more range predicates use either the range or regions dispatcher.
+
+Every dispatcher returns physical position arrays or an aggregation result.
+The shared helpers materialize those positions back into pandas rows, which
+keeps outer-join, indicator, column-selection, and positional-index behavior
+consistent across all algorithms.
+"""
+
+from __future__ import annotations
+
+import warnings
+from typing import Any, Hashable, Literal, Optional
+
+import numpy as np
+import pandas as pd
+import pandas_flavor as pf
 from pandas.api.types import (
     is_datetime64_dtype,
-    is_integer_dtype,
-    is_float_dtype,
-    is_string_dtype,
-    is_extension_array_dtype,
-    is_categorical_dtype,
+    is_dtype_equal,
+    is_numeric_dtype,
+    is_timedelta64_dtype,
 )
-import pandas_flavor as pf
-import pandas as pd
-from typing import Union
-import operator
-from janitor.utils import check, check_column
-import numpy as np
-from enum import Enum
-from itertools import compress
+
+from janitor.utils import check, check_column, deprecated_kwargs
+
+from ._conditional_join import (
+    _equi_join,
+    _helpers,
+    _multi_range_join,
+    _not_equals_only,
+    _regions,
+    _single_range_predicate,
+)
+from ._conditional_join._helpers import (
+    _JoinOperator,
+    _normalize_conditions,
+    greater_than_join_types,
+    less_than_join_types,
+)
+
+_REVERSE_OPERATOR = {
+    "<": ">",
+    "<=": ">=",
+    ">": "<",
+    ">=": "<=",
+    "==": "==",
+    "!=": "!=",
+}
 
 
 @pf.register_dataframe_method
 def conditional_join(
     df: pd.DataFrame,
-    right: Union[pd.DataFrame, pd.Series],
-    *conditions,
-    how: str = "inner",
-    sort_by_appearance: bool = False,
+    right: pd.DataFrame | pd.Series,
+    *conditions: tuple,
+    how: Literal[
+        "inner", "left", "right", "outer", "left_anti", "right_anti"
+    ] = "inner",
+    df_columns: Optional[Any] = slice(None),
+    right_columns: Optional[Any] = slice(None),
+    keep: Literal["first", "last", "any", "all"] = "all",
+    use_numba: bool | None = None,
+    indicator: Optional[bool | str] = False,
+    force: bool = False,
+    join_algorithm: str = "default",
+    include_join_positions: bool = False,
 ) -> pd.DataFrame:
-    """
-
-    This is a convenience function that operates similarly to ``pd.merge``,
-    but allows joins on inequality operators,
+    """The conditional_join function operates similarly to `pd.merge`,
+    but supports joins on inequality operators,
     or a combination of equi and non-equi joins.
 
-    If the join is solely on equality, `pd.merge` function
-    is more efficient and should be used instead.
+    Joins solely on equality are not supported.
 
-    If you are interested in nearest joins, or rolling joins,
-    `pd.merge_asof` covers that. There is also the IntervalIndex,
-    which is usually more efficient for range joins, especially if
-    the intervals do not overlap.
+    If the join is solely on equality, `pd.merge` function
+    covers that; if you are interested in nearest joins, asof joins,
+    or rolling joins, then `pd.merge_asof` covers that.
+    There is also pandas' IntervalIndex, which is efficient for range joins,
+    especially if the intervals do not overlap.
+
+    Column selection in `df_columns` and `right_columns` is possible using the
+    [`select_columns`][janitor.functions.select.select_columns] syntax.
+
+    !!! warning
+        The `df_columns` and `right_columns` parameters are deprecated.
+        Select or rename columns on the DataFrame before calling `conditional_join`.
+
+    Noticeable performance can be observed for range joins,
+    if both join columns from the right dataframe
+    are monotonically increasing.
 
     This function returns rows, if any, where values from `df` meet the
     condition(s) for values from `right`. The conditions are passed in
@@ -47,111 +107,742 @@ def conditional_join(
     label from `df`, `right_on` is the column label from `right`,
     while `op` is the operator.
 
+    For multiple conditions, the and(`&`)
+    operator is used to combine the results of the individual conditions.
+
+    In some scenarios there might be performance gains if a mixed
+    equality/range join uses the non-equi path. The range predicates drive
+    candidate generation before the equality predicates are applied as
+    residual filters; pass ``force=True`` to request this. It has no effect on
+    joins that mix equality and ``!=`` predicates without a range predicate.
+
+    ``join_algorithm`` selects the strategy for joins with multiple range
+    predicates. ``"default"`` uses the general range-join implementation;
+    ``"regions"`` uses the region-based implementation, which can be useful
+    when the predicates describe interval-like regions. The option is ignored
+    for equality-only, single-range, and all-``!=`` joins.
+
     The operator can be any of `==`, `!=`, `<=`, `<`, `>=`, `>`.
 
-    A binary search is used to get the relevant rows for non-equi joins;
-    this avoids a cartesian join, and makes the process less memory intensive.
-
-    For equi-joins, Pandas internal merge function (a hash join) is used.
-
     The join is done only on the columns.
-    MultiIndex columns are not supported.
 
-    For non-equi joins, only numeric and date columns are supported.
+    For non-equi joins, only numeric, timedelta and date columns are supported.
 
-    Only `inner`, `left`, and `right` joins are supported.
+    `inner`, `left`, `right`, `outer`, `left_anti` and `right_anti`
+    joins are supported.
 
     If the columns from `df` and `right` have nothing in common,
     a single index column is returned; else, a MultiIndex column
     is returned.
 
-    Functional usage syntax:
+    If `include_join_positions` is `True`, the index of the returned dataframe
+    will be a MultiIndex; the first level points to the original positions in `df`,
+    while the second level points to the original positions in `right`.
 
-    ```python
-        import pandas as pd
-        import janitor as jn
+    Examples:
+        >>> import pandas as pd
+        >>> import janitor
+        >>> df1 = pd.DataFrame({"value_1": [2, 5, 7, 1, 3, 4]})
+        >>> df2 = pd.DataFrame(
+        ...     {
+        ...         "value_2A": [0, 3, 7, 12, 0, 2, 3, 1],
+        ...         "value_2B": [1, 5, 9, 15, 1, 4, 6, 3],
+        ...     }
+        ... )
+        >>> df1
+           value_1
+        0        2
+        1        5
+        2        7
+        3        1
+        4        3
+        5        4
+        >>> df2
+           value_2A  value_2B
+        0         0         1
+        1         3         5
+        2         7         9
+        3        12        15
+        4         0         1
+        5         2         4
+        6         3         6
+        7         1         3
 
-        df = pd.DataFrame(...)
-        right = pd.DataFrame(...)
+        >>> df1.conditional_join(
+        ...     df2, ("value_1", "value_2A", ">"), ("value_1", "value_2B", "<")
+        ... )
+           value_1  value_2A  value_2B
+        0        2         1         3
+        1        5         3         6
+        2        3         2         4
+        3        4         3         5
+        4        4         3         6
 
-        df = jn.conditional_join(
-                df,
-                right,
-                (col_from_df, col_from_right, join_operator),
-                (col_from_df, col_from_right, join_operator),
-                ...,
-                how = 'inner' # or left/right
-                sort_by_appearance = True # or False
-                )
-    ```
+        Select specific columns, after the join:
+        >>> df1.conditional_join(
+        ...     df2,
+        ...     ("value_1", "value_2A", ">"),
+        ...     ("value_1", "value_2B", "<"),
+        ...     right_columns="value_2B",
+        ...     how="left",
+        ... )
+           value_1  value_2B
+        0        2       3.0
+        1        5       6.0
+        2        3       4.0
+        3        4       5.0
+        4        4       6.0
+        5        7       NaN
+        6        1       NaN
 
-    Method chaining syntax:
+        Rename columns, before the join:
+        >>> (
+        ...     df1.rename(columns={"value_1": "left_column"}).conditional_join(
+        ...         df2,
+        ...         ("left_column", "value_2A", ">"),
+        ...         ("left_column", "value_2B", "<"),
+        ...         right_columns="value_2B",
+        ...         how="outer",
+        ...     )
+        ... )
+            left_column  value_2B
+        0           2.0       3.0
+        1           5.0       6.0
+        2           3.0       4.0
+        3           4.0       5.0
+        4           4.0       6.0
+        5           7.0       NaN
+        6           1.0       NaN
+        7           NaN       1.0
+        8           NaN       9.0
+        9           NaN      15.0
+        10          NaN       1.0
 
-    ```python
-        df.conditional_join(
-            right,
-            (col_from_df, col_from_right, join_operator),
-            (col_from_df, col_from_right, join_operator),
-            ...,
-            how = 'inner' # or left/right
-            sort_by_appearance = True # or False
-            )
-    ```
+        Get the first match:
+        >>> df1.conditional_join(
+        ...     df2,
+        ...     ("value_1", "value_2A", ">"),
+        ...     ("value_1", "value_2B", "<"),
+        ...     keep="first",
+        ... )
+           value_1  value_2A  value_2B
+        0        2         1         3
+        1        5         3         6
+        2        3         2         4
+        3        4         3         5
+
+        Get the last match:
+        >>> df1.conditional_join(
+        ...     df2,
+        ...     ("value_1", "value_2A", ">"),
+        ...     ("value_1", "value_2B", "<"),
+        ...     keep="last",
+        ... )
+           value_1  value_2A  value_2B
+        0        2         1         3
+        1        5         3         6
+        2        3         2         4
+        3        4         3         6
+
+        Get any match for each left row. The selected match is not ordered:
+        >>> df1.conditional_join(
+        ...     df2,
+        ...     ("value_1", "value_2A", ">"),
+        ...     ("value_1", "value_2B", "<"),
+        ...     keep="any",
+        ... )
+           value_1  value_2A  value_2B
+        0        2         1         3
+        1        5         3         6
+        2        3         2         4
+        3        4         3         5
+
+        Add an indicator column:
+        >>> df1.conditional_join(
+        ...     df2,
+        ...     ("value_1", "value_2A", ">"),
+        ...     ("value_1", "value_2B", "<"),
+        ...     how="outer",
+        ...     indicator=True,
+        ... )
+            value_1  value_2A  value_2B      _merge
+        0       2.0       1.0       3.0        both
+        1       5.0       3.0       6.0        both
+        2       3.0       2.0       4.0        both
+        3       4.0       3.0       5.0        both
+        4       4.0       3.0       6.0        both
+        5       7.0       NaN       NaN   left_only
+        6       1.0       NaN       NaN   left_only
+        7       NaN       0.0       1.0  right_only
+        8       NaN       7.0       9.0  right_only
+        9       NaN      12.0      15.0  right_only
+        10      NaN       0.0       1.0  right_only
+
+        Use ``force=True`` when a mixed equality/range join should use the
+        non-equi preparation order, and select the regions algorithm for a
+        multi-range join when desired:
+
+        >>> forced = df1.conditional_join(
+        ...     df2,
+        ...     ("value_1", "value_2A", "=="),
+        ...     ("value_1", "value_2B", "<"),
+        ...     force=True,
+        ... )
+        >>> regional = df1.conditional_join(
+        ...     df2,
+        ...     ("value_1", "value_2A", ">"),
+        ...     ("value_1", "value_2B", "<"),
+        ...     join_algorithm="regions",
+        ...     include_join_positions=True,
+        ... )
+        >>> isinstance(regional.index, pd.MultiIndex)
+        True
+
+        ``include_join_positions=True`` adds the physical left and right row
+        positions to the result index. These are zero-based positions, not the
+        original pandas index labels:
+
+        >>> left = pd.DataFrame({"value": [1, 2]})
+        >>> right = pd.DataFrame({"value": [2, 3]})
+        >>> positioned = left.conditional_join(
+        ...     right,
+        ...     ("value", "value", "<"),
+        ...     include_join_positions=True,
+        ... )
+        >>> print(positioned.to_string())
+             left right
+            value value
+        0 0     1     2
+          1     1     3
+        1 1     2     3
+        >>> positioned.index.tolist()
+        [(0, 0), (0, 1), (1, 1)]
+
+    !!! abstract "Version Changed"
+
+        - 0.24.0
+            - Added `df_columns`, `right_columns` and `keep` parameters.
+        - 0.24.1
+            - Added `indicator` parameter.
+        - 0.25.0
+            - `col` class supported.
+            - Outer join supported. `sort_by_appearance` is deprecated.
+        - 0.27.0
+            - Added support for timedelta dtype.
+        - 0.28.0
+            - `col` class is deprecated.
+        - 0.32.10
+            - Added `include_join_positions` parameter.
+            - Added `join_algorithm` parameter.
+        - 0.32.27
+            - The `use_numba` parameter is deprecated and has no effect.
+
+    Args:
+        df: A pandas DataFrame.
+        right: Named Series or DataFrame to join to.
+        conditions: Variable argument of tuple(s) of the form
+            `(left_on, right_on, op)`, where `left_on` is the column
+            label from `df`, `right_on` is the column label from `right`,
+            while `op` is the operator.
+            The operator can be any of
+            `==`, `!=`, `<=`, `<`, `>=`, `>`. For multiple conditions,
+            the and(`&`) operator is used to combine the results
+            of the individual conditions.
+        how: Indicates the type of join to be performed.
+            It can be one of `inner`, `left`, `right`, `outer`,
+            `left_anti` or `right_anti`.
+            Anti joins retain only the requested side's rows that have no
+            matching partner. Set the other side's column selector to `None`
+            when only the preserved side is wanted.
+        df_columns: Columns to select from `df` in the final output dataframe.
+            Column selection is based on the
+            [`select_columns`][janitor.functions.select.select_columns] syntax.
+            !!! warning "Deprecated in 0.33.0"
+                `df_columns` will be removed in a future release.
+                Select or rename columns directly on the DataFrame before calling `conditional_join`.
+        right_columns: Columns to select from `right` in the final output dataframe.
+            Column selection is based on the
+            [`select_columns`][janitor.functions.select.select_columns] syntax.
+            !!! warning "Deprecated in 0.33.0"
+                `right_columns` will be removed in a future release.
+                Select or rename columns directly on the DataFrame before calling `conditional_join`.
+        keep: Choose whether to return the first match, last match, any match,
+            or all matches.
+        use_numba: Deprecated no-op retained for compatibility with older
+            callers. Its value is ignored.
+        indicator: If `True`, adds a column to the output DataFrame
+            called `_merge` with information on the source of each row.
+            The column can be given a different name by providing a string argument.
+            The column will have a Categorical type with the value of `left_only`
+            for observations whose merge key only appears in the left DataFrame,
+            `right_only` for observations whose merge key
+            only appears in the right DataFrame, and `both` if the observation’s
+            merge key is found in both DataFrames.
+        force: If ``True``, force mixed equality/range joins to use the
+            non-equi path, with range predicates driving candidate generation
+            before equality predicates are applied. It has no effect on joins
+            that mix equality and ``!=`` predicates without a range predicate.
+        join_algorithm: Strategy for joins with multiple range predicates.
+            ``"default"`` uses the general range-join implementation and
+            ``"regions"`` uses the region-based implementation. The option is
+            ignored for equality-only, single-range, and all-``!=`` joins.
+        include_join_positions: If ``True``, include the matched physical row
+            positions in the result index as a two-level ``MultiIndex``. The
+            first level contains zero-based positions from ``df`` and the
+            second contains zero-based positions from ``right``; these are
+            positions in the input row order, not the original index labels.
+            This option is available only for inner joins.
 
 
-    :param df: A Pandas DataFrame.
-    :param right: Named Series or DataFrame to join to.
-    :param conditions: Variable argument of tuple(s) of the form
-        `(left_on, right_on, op)`, where `left_on` is the column
-        label from `df`, `right_on` is the column label from `right`,
-        while `op` is the operator. The operator can be any of
-        `==`, `!=`, `<=`, `<`, `>=`, `>`.
-    :param how: Indicates the type of join to be performed.
-        It can be one of `inner`, `left`, `right`.
-        Full join is not supported. Defaults to `inner`.
-    :param sort_by_appearance: Default is `False`. If True,
-        values from `right` that meet the join condition will be returned
-        in the final dataframe in the same order
-        that they were before the join.
-    :returns: A pandas DataFrame of the two merged Pandas objects.
-    """
+
+    Returns:
+        A pandas DataFrame of the two merged Pandas objects.
+    """  # noqa: E501
+
+    if use_numba is not None:
+        warnings.warn(
+            "The 'use_numba' parameter is deprecated and has no effect.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     return _conditional_join_compute(
-        df, right, conditions, how, sort_by_appearance
+        df=df,
+        right=right,
+        conditions=conditions,
+        how=how,
+        df_columns=df_columns,
+        right_columns=right_columns,
+        keep=keep,
+        indicator=indicator,
+        force=force,
+        aggfunc=None,
+        include_join_positions=include_join_positions,
+        return_building_blocks=False,
+        reverse=False,
+        return_matching_indices=False,
+        join_algorithm=join_algorithm,
     )
 
 
-class _JoinOperator(Enum):
+def _check_operator(op: str):
+    """Validate one public conditional-join operator.
+
+    Args:
+        op: Operator supplied in a three-element condition tuple.
+
+    Raises:
+        ValueError: If ``op`` is not one of ``>``, ``>=``, ``==``, ``!=``,
+            ``<``, or ``<=``.
     """
-    List of operators used in conditional_join.
+    sequence_of_operators = {op.value for op in _JoinOperator}
+    if op not in sequence_of_operators:
+        raise ValueError(
+            f"The conditional join operator should be one of {sequence_of_operators}"
+        )
+
+
+def _check_conditions(
+    df: pd.DataFrame,
+    right: pd.DataFrame,
+    conditions: tuple,
+) -> None:
+    """Validate all public predicate tuples before dispatch.
+
+    This is deliberately separate from dtype validation.  Shape and column
+    errors can be reported without inspecting values, while dtype validation
+    is performed later for each pair of referenced columns. Keeping these
+    phases separate also lets equality-only aggregation requests reach the
+    equi aggregation path without accidentally routing ordinary equality
+    joins through a non-equi kernel.
+
+    Args:
+        df: Left dataframe whose columns are referenced by the conditions.
+        right: Right dataframe whose columns are referenced by the conditions.
+        conditions: Public ``(left_column, right_column, operator)`` tuples.
+
+    Raises:
+        ValueError: If no conditions are supplied, a tuple has the wrong
+            length, or an operator is unsupported.
+        TypeError: If a condition or column reference has the wrong type.
+        KeyError: If a referenced column does not exist.
+    """
+    if not conditions:
+        raise ValueError("Kindly provide at least one join condition.")
+
+    for condition in conditions:
+        check("condition", condition, [tuple])
+        if len(condition) != 3:
+            raise ValueError(
+                "condition should have only three elements; "
+                f"{condition} however is of length {len(condition)}."
+            )
+
+        left_on, right_on, op = condition
+        check("left_on", left_on, [Hashable])
+        check("right_on", right_on, [Hashable])
+        check("operator", op, [str])
+        check_column(df, [left_on])
+        check_column(right, [right_on])
+        _check_operator(op)
+
+
+def _check_aggfunc(
+    df: pd.DataFrame,
+    right: pd.DataFrame,
+    aggfunc: list[tuple] | None,
+    reverse: bool,
+) -> None:
+    """Validate aggregation requests against their source dataframe.
+
+    Aggregations read from the right dataframe for forward joins and from the
+    left dataframe for reverse joins. Validation follows that same direction
+    so a request cannot silently read from the wrong side after dispatch.
+
+    Args:
+        df: Left dataframe and reverse-aggregation source.
+        right: Right dataframe and forward-aggregation source.
+        aggfunc: ``(column, operation)`` requests, or ``None`` for index
+            output. Supported operations are ``sum``, ``count``, ``min``,
+            ``max``, ``size``, and ``prod``.
+        reverse: Whether source values come from ``df`` instead of ``right``.
+
+    Raises:
+        ValueError: If a request is malformed, unsupported, or uses an
+            operation incompatible with its source dtype.
+        KeyError: If a requested aggregation column is absent.
+    """
+    if aggfunc is None:
+        return
+
+    check("aggfunc", aggfunc, [list])
+    frame = df if reverse else right
+    side = "left" if reverse else "right"
+    supported = {"sum", "count", "min", "max", "size", "prod"}
+
+    for entry in aggfunc:
+        check("entry in aggfunc", entry, [tuple])
+        if len(entry) != 2:
+            raise ValueError(
+                "The tuple in an aggfunc should be 2 elements; "
+                "The first element in the tuple should be a column name "
+                f"in the {side} dataframe, while the second element "
+                "should be a supported aggregation function"
+            )
+
+        column_name, agg = entry
+        if column_name not in frame.columns:
+            raise KeyError(
+                f"{column_name} in aggfunc does not exist in the {side} dataframe"
+            )
+        if agg not in supported:
+            raise ValueError(
+                f"The aggregation function for {column_name} should be one of "
+                f"{','.join(supported)}; instead got {agg}"
+            )
+
+        series = frame[column_name]
+        if agg in {"sum", "prod"} and not is_numeric_dtype(series):
+            raise ValueError(f"{agg} is supported only for numeric columns")
+        if (
+            agg in {"min", "max"}
+            and not is_numeric_dtype(series)
+            and not is_datetime64_dtype(series)
+            and not is_timedelta64_dtype(series)
+        ):
+            raise ValueError(
+                f"{agg} is supported only for numeric, datetime, timedelta columns"
+            )
+
+
+def _conditional_join_preliminary_checks(
+    df: pd.DataFrame,
+    right: pd.DataFrame | pd.Series,
+    conditions: tuple,
+    how: str,
+    df_columns: Any,
+    right_columns: Any,
+    keep: str,
+    indicator: bool | str,
+    force: bool,
+    return_matching_indices: bool = False,
+    aggfunc: list[tuple] = None,
+    include_join_positions: bool = False,
+    return_building_blocks: bool = False,
+    reverse: bool = False,
+    join_algorithm: str = "default",
+    return_matched: bool = False,
+) -> tuple:
+    """Normalize and validate inputs shared by every conditional-join path.
+
+    This function owns public argument validation and returns shallow copies
+    so downstream preparation can reset indexes without mutating caller-owned
+    dataframes. It intentionally does not choose a Rust/kernel path; that
+    decision belongs to :func:`_conditional_join_compute` after dtype checks.
+
+    Args:
+        df: Left dataframe.
+        right: Right dataframe or named Series, converted to a dataframe.
+        conditions: Public predicate tuples.
+        how: Requested join shape.
+        df_columns: Deprecated left-column selection.
+        right_columns: Deprecated right-column selection.
+        keep: Match-selection policy.
+        indicator: Whether to include a merge indicator column.
+        force: If ``True``, force mixed equality/range joins to use the
+            non-equi path, with range predicates driving candidate generation
+            before equality predicates are applied. It has no effect on joins
+            that mix equality and ``!=`` predicates without a range predicate.
+        return_matching_indices: Whether callers want physical index arrays.
+        aggfunc: Aggregation requests, when the caller is ``join_agg``.
+        include_join_positions: Whether materialized inner-join output includes
+            matched physical left/right row positions in a two-level
+            ``MultiIndex``. Positions are zero-based input-row positions, not
+            the original pandas index labels.
+        return_building_blocks: Experimental. Whether to preserve kernel
+            building blocks.
+        reverse: Whether aggregation reads from the left side.
+        join_algorithm: Multi-range strategy: ``"default"`` uses the general
+            range-join implementation and ``"regions"`` uses the region-based
+            implementation. It is ignored when the join is not a multi-range
+            join.
+        return_matched: Whether aggregation output includes a match mask.
+
+    Returns:
+        Shallow copies of the validated left and right dataframes.
+
+    Raises:
+        TypeError, ValueError, or KeyError: If a public argument is invalid.
     """
 
-    GREATER_THAN = ">"
-    LESS_THAN = "<"
-    GREATER_THAN_OR_EQUAL = ">="
-    LESS_THAN_OR_EQUAL = "<="
-    STRICTLY_EQUAL = "=="
-    NOT_EQUAL = "!="
+    check("right", right, [pd.DataFrame, pd.Series])
+
+    if isinstance(right, pd.Series):
+        if not right.name:
+            raise ValueError("Unnamed Series are not supported for conditional_join.")
+        right = right.to_frame()
+
+    if df_columns != slice(None):
+        warnings.warn(
+            "The 'df_columns' parameter is deprecated and will be removed in a "
+            "future release. Please select or rename columns on the left "
+            "DataFrame before calling conditional_join.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    if right_columns != slice(None):
+        warnings.warn(
+            "The 'right_columns' parameter is deprecated and will be removed in a "
+            "future release. Please select or rename columns on the right "
+            "DataFrame before calling conditional_join.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    # Check MultiIndex column level mismatch first, before any column existence checks
+    if df.columns.nlevels != right.columns.nlevels:
+        raise ValueError(
+            "The number of column levels "
+            "from the left and right frames must match. "
+            "The number of column levels from the left dataframe "
+            f"is {df.columns.nlevels}, while the number of column levels "
+            f"from the right dataframe is {right.columns.nlevels}."
+        )
+
+    _check_conditions(df, right, conditions)
+
+    check("how", how, [str])
+
+    join_types = {"inner", "left", "right", "outer", "left_anti", "right_anti"}
+    if how not in join_types:
+        raise ValueError(
+            "'how' should be one of 'inner', 'left', 'right', 'outer', "
+            "'left_anti' or 'right_anti'."
+        )
+    if how == "left_anti" and df_columns is None:
+        raise ValueError("df_columns cannot be None for a left_anti join.")
+    if how == "right_anti" and right_columns is None:
+        raise ValueError("right_columns cannot be None for a right_anti join.")
+
+    check("keep", keep, [str])
+
+    if keep not in {"all", "first", "last", "any"}:
+        raise ValueError("'keep' should be one of 'all', 'first', 'last', 'any'.")
+
+    check("indicator", indicator, [bool, str])
+
+    check("force", force, [bool])
+
+    check("reverse", reverse, [bool])
+
+    _check_aggfunc(df, right, aggfunc, reverse)
+    if all((op == _JoinOperator.STRICTLY_EQUAL.value for *_, op in conditions)):
+        if not (return_matching_indices or aggfunc):
+            raise ValueError("Equality only joins are not supported.")
+
+    check("include_join_positions", include_join_positions, [bool])
+    if include_join_positions and (how != "inner"):
+        raise ValueError("include_join_positions is valid only if `how='inner'`")
+    check("return_building_blocks", return_building_blocks, [bool])
+    if all(op == "!=" for *_, op in conditions) and return_building_blocks:
+        keep = "all"
+
+    check("join_algorithm", join_algorithm, [str])
+    if join_algorithm not in {"default", "regions"}:
+        raise ValueError(
+            f"join_algorithm should be either default or regions, "
+            f"instead got {join_algorithm}"
+        )
+    check("return_matched", return_matched, [bool])
+
+    # Only index and column metadata are reassigned downstream. Shallow copies
+    # protect the caller's frames without duplicating every column buffer.
+    return df.copy(deep=False), right.copy(deep=False)
 
 
-class _JoinTypes(Enum):
+def _conditional_join_type_check(
+    left_column: pd.Series,
+    right_column: pd.Series,
+    op: str,
+    force: bool,
+) -> None:
+    """Validate the dtype contract for one pair of join columns.
+
+    Equality columns may use arbitrary pandas dtypes on the normal equi path.
+    A forced equality or any inequality must use equal, numeric, datetime, or
+    timedelta dtypes because those paths eventually use typed positional
+    kernels.
+
+    Args:
+        left_column: Left condition column.
+        right_column: Right condition column.
+        op: Comparison operator for the condition.
+        force: Whether an equality condition is being forced through the
+            non-equi preparation path.
+
+    Raises:
+        TypeError: If an inequality-compatible dtype is unsupported or the
+            two columns have unequal dtypes.
     """
-    List of join types for conditional_join.
+
+    strictly_equal = op == _JoinOperator.STRICTLY_EQUAL.value
+    if (
+        ((not strictly_equal) or (force and strictly_equal))
+        and not is_numeric_dtype(left_column)
+        and not is_datetime64_dtype(left_column)
+        and not is_timedelta64_dtype(left_column)
+    ):
+        raise TypeError(
+            "Only numeric, timedelta and datetime types "
+            "are supported in a non equi-join, "
+            f"{left_column.name} in condition "
+            f"({left_column.name}, {right_column.name}, {op}) "
+            f"has a dtype {left_column.dtype}."
+        )
+
+    if ((not strictly_equal) or (force and strictly_equal)) and not is_dtype_equal(
+        left_column, right_column
+    ):
+        raise TypeError(
+            f"Both columns should have the same type - "
+            f"'{left_column.name}' has {left_column.dtype} type;"
+            f"'{right_column.name}' has {right_column.dtype} type."
+        )
+
+    return None
+
+
+def _compute_anti_join(
+    df: pd.DataFrame,
+    right: pd.DataFrame,
+    conditions: list,
+    how: str,
+    df_columns: Any,
+    right_columns: Any,
+    indicator: bool | str,
+    force: bool,
+    join_algorithm: str,
+    return_matching_indices: bool,
+) -> pd.DataFrame | dict[str, np.ndarray]:
+    """Return rows with no complete matching partner.
+
+    Anti joins are existence queries. The inner join is therefore executed
+    with ``keep="any"``: one valid pair is sufficient to mark a preserved row
+    as matched, while no pair means that no complete predicate conjunction
+    survived. ``right_anti`` swaps the driving side and reverses directional
+    operators so the same invariant applies per original right row.
     """
+    anti_conditions = [
+        (condition.left, condition.right, condition.op) for condition in conditions
+    ]
+    if how == "right_anti":
+        match_df, match_right = right, df
+        anti_conditions = [
+            (right_on, left_on, _REVERSE_OPERATOR[op])
+            for left_on, right_on, op in anti_conditions
+        ]
+    else:
+        match_df, match_right = df, right
 
-    INNER = "inner"
-    LEFT = "left"
-    RIGHT = "right"
+    matches = _conditional_join_compute(
+        df=match_df,
+        right=match_right,
+        conditions=anti_conditions,
+        how="inner",
+        df_columns=slice(None),
+        right_columns=slice(None),
+        keep="any",
+        indicator=False,
+        force=force,
+        return_matching_indices=True,
+        aggfunc=None,
+        include_join_positions=False,
+        return_building_blocks=False,
+        join_algorithm=join_algorithm,
+        return_matched=False,
+    )
+    matched_positions = np.asarray(matches["left_index"], dtype=np.intp)
+    matched_positions = np.unique(matched_positions)
+    all_positions = np.arange(len(match_df), dtype=np.intp)
+    unmatched_positions = np.setdiff1d(
+        all_positions,
+        matched_positions,
+        assume_unique=True,
+    )
+    empty = np.array([], dtype=np.intp)
 
+    if return_matching_indices:
+        if how == "left_anti":
+            return {"left_index": unmatched_positions, "right_index": empty}
+        return {"left_index": empty, "right_index": unmatched_positions}
 
-operator_map = {
-    _JoinOperator.STRICTLY_EQUAL.value: operator.eq,
-    _JoinOperator.LESS_THAN.value: operator.lt,
-    _JoinOperator.LESS_THAN_OR_EQUAL.value: operator.le,
-    _JoinOperator.GREATER_THAN.value: operator.gt,
-    _JoinOperator.GREATER_THAN_OR_EQUAL.value: operator.ge,
-    _JoinOperator.NOT_EQUAL.value: operator.ne,
-}
+    # Reuse the normal materializer with an empty opposite-side frame. This
+    # preserves column selection, inferred null dtypes, and indicator labels
+    # without manufacturing a fake matching pair.
+    if how == "left_anti":
+        return _helpers._materialize_index_result(
+            df=df.iloc[unmatched_positions],
+            right=right.iloc[:0],
+            left_index=empty,
+            right_index=empty,
+            how="left",
+            df_columns=df_columns,
+            right_columns=right_columns,
+            indicator=indicator,
+            include_join_positions=False,
+        )
+    return _helpers._materialize_index_result(
+        df=df.iloc[:0],
+        right=right.iloc[unmatched_positions],
+        left_index=empty,
+        right_index=empty,
+        how="right",
+        df_columns=df_columns,
+        right_columns=right_columns,
+        indicator=indicator,
+        include_join_positions=False,
+    )
 
 
 def _conditional_join_compute(
@@ -159,1001 +850,562 @@ def _conditional_join_compute(
     right: pd.DataFrame,
     conditions: list,
     how: str,
-    sort_by_appearance: bool,
+    df_columns: Any,
+    right_columns: Any,
+    keep: str,
+    indicator: bool | str,
+    force: bool,
+    return_matching_indices: bool = False,
+    aggfunc: list[tuple] = None,
+    include_join_positions: bool = False,
+    return_building_blocks: bool = False,
+    reverse: bool = False,
+    join_algorithm: str = "default",
+    return_matched: bool = False,
 ) -> pd.DataFrame:
+    """Execute the validated conditional join or aggregation request.
+
+    The dispatcher first resets working indexes to physical positions. Those
+    positions are the only indexes sent to Rust and remain paired with sorted
+    values throughout preparation. The selected family returns physical pairs
+    or aggregation arrays; the shared materializer then restores the pandas
+    result shape.
+
+    Args:
+        df: Validated left dataframe.
+        right: Validated right dataframe.
+        conditions: Validated predicate tuples.
+        how: Requested join shape.
+        df_columns: Deprecated left output selection.
+        right_columns: Deprecated right output selection.
+        keep: Match-selection policy.
+        indicator: Indicator-column request.
+        force: If ``True``, force mixed equality/range joins to use the
+            non-equi path, with range predicates driving candidate generation
+            before equality predicates are applied. It has no effect on joins
+            that mix equality and ``!=`` predicates without a range predicate.
+        return_matching_indices: Return physical index arrays instead of rows.
+        aggfunc: Aggregation requests, or ``None`` for index output.
+        include_join_positions: Include matched physical left/right row
+            positions in a two-level ``MultiIndex`` on dataframe output.
+            Positions are zero-based input-row positions, not original pandas
+            index labels; this is valid only for inner joins.
+        return_building_blocks: Experimental. Preserve starts/ends or
+            equivalent kernel building blocks.
+        reverse: Aggregate left values into right output rows.
+        join_algorithm: Multi-range strategy: ``"default"`` uses the general
+            range-join implementation and ``"regions"`` uses the region-based
+            implementation. It is ignored when the join is not a multi-range
+            join.
+        return_matched: Include aggregation match metadata.
+
+    Returns:
+        A dataframe, physical-index dictionary, or kernel building-block
+        dictionary depending on the requested mode.
     """
-    This is where the actual computation
-    for the conditional join takes place.
-    A pandas DataFrame is returned.
-    """
-
-    (
-        df,
-        right,
-        conditions,
-        how,
-        sort_by_appearance,
-    ) = _conditional_join_preliminary_checks(
-        df, right, conditions, how, sort_by_appearance
-    )
-
-    eq_check = False
-    le_lt_check = False
-    for condition in conditions:
-        left_on, right_on, op = condition
-        _conditional_join_type_check(df[left_on], right[right_on], op)
-        if op == _JoinOperator.STRICTLY_EQUAL.value:
-            eq_check = True
-        elif op in less_than_join_types.union(greater_than_join_types):
-            le_lt_check = True
-
-    df.index = pd.RangeIndex(start=0, stop=len(df))
-    right.index = pd.RangeIndex(start=0, stop=len(right))
-
-    if len(conditions) == 1:
-        left_on, right_on, op = conditions[0]
-
-        result = _generic_func_cond_join(
-            df, right, left_on, right_on, op, "single"
-        )
-
-        if result is None:
-            return _create_conditional_join_empty_frame(df, right, how)
-
-        left_c, right_c = result
-
-        return _create_conditional_join_frame(
-            df, right, left_c, right_c, how, sort_by_appearance
-        )
-
-    # multiple conditions
-    if eq_check:
-        result = _multiple_conditional_join_eq(df, right, conditions)
-    elif le_lt_check:
-        result = _multiple_conditional_join_le_lt(df, right, conditions)
-    else:
-        result = _multiple_conditional_join_ne(df, right, conditions)
-
-    if result is None:
-        return _create_conditional_join_empty_frame(df, right, how)
-
-    left_c, right_c = result
-
-    return _create_conditional_join_frame(
-        df, right, left_c, right_c, how, sort_by_appearance
-    )
-
-
-def _conditional_join_preliminary_checks(
-    df: pd.DataFrame,
-    right: Union[pd.DataFrame, pd.Series],
-    conditions: tuple,
-    how: str,
-    sort_by_appearance: bool,
-) -> tuple:
-    """
-    Preliminary checks for conditional_join are conducted here.
-
-    This function checks for conditions such as
-    MultiIndexed dataframe columns,
-    as well as unnamed Series.
-
-    A tuple of
-    (`df`, `right`, `left_on`, `right_on`, `operator`)
-    is returned.
-    """
-
-    if isinstance(df.columns, pd.MultiIndex):
-        raise ValueError(
-            """
-            MultiIndex columns are not
-            supported for conditional_join.
-            """
-        )
-
-    check("`right`", right, [pd.DataFrame, pd.Series])
-
-    df = df.copy()
-    right = right.copy()
-
-    if isinstance(right, pd.Series):
-        if not right.name:
-            raise ValueError(
-                """
-                Unnamed Series are not supported
-                for conditional_join.
-                """
-            )
-        right = right.to_frame()
-
-    if isinstance(right.columns, pd.MultiIndex):
-        raise ValueError(
-            """
-            MultiIndex columns are not supported
-            for conditional joins.
-            """
-        )
-
-    if not conditions:
-        raise ValueError(
-            """
-            Kindly provide at least one join condition.
-            """
-        )
-
-    for condition in conditions:
-        check("condition", condition, [tuple])
-        len_condition = len(condition)
-        if len_condition != 3:
-            raise ValueError(
-                f"""
-                condition should have only three elements.
-                {condition} however is of length {len_condition}.
-                """
-            )
-
-    for left_on, right_on, op in conditions:
-        check("left_on", left_on, [str])
-        check("right_on", right_on, [str])
-        check("operator", op, [str])
-        check_column(df, left_on)
-        check_column(right, right_on)
-        _check_operator(op)
-
-    check("how", how, [str])
-
-    join_types = {jointype.value for jointype in _JoinTypes}
-    if how not in join_types:
-        raise ValueError(f"`how` should be one of {', '.join(join_types)}.")
-
-    check("sort_by_appearance", sort_by_appearance, [bool])
-
-    return df, right, conditions, how, sort_by_appearance
-
-
-def _conditional_join_type_check(
-    left_column: pd.Series, right_column: pd.Series, op: str
-) -> None:
-    """
-    Raise error if column type is not
-    any of numeric or datetime or string.
-    """
-
-    permitted_types = {
-        is_datetime64_dtype,
-        is_integer_dtype,
-        is_float_dtype,
-        is_string_dtype,
-        is_categorical_dtype,
-    }
-    for func in permitted_types:
-        if func(left_column):
-            break
-    else:
-        raise ValueError(
-            """
-            conditional_join only supports
-            string, category, integer,
-            float or date dtypes.
-            """
-        )
-    cols = (left_column, right_column)
-    for func in permitted_types:
-        if all(map(func, cols)):
-            break
-    else:
-        raise ValueError(
-            f"""
-             Both columns should have the same type.
-             `{left_column.name}` has {left_column.dtype} type;
-             `{right_column.name}` has {right_column.dtype} type.
-             """
-        )
-
-    if (
-        is_string_dtype(left_column)
-        and op != _JoinOperator.STRICTLY_EQUAL.value
-    ):
-        raise ValueError(
-            """
-            For string columns,
-            only the `==` operator is supported.
-            """
-        )
-
-    if (
-        is_categorical_dtype(left_column)
-        and op != _JoinOperator.STRICTLY_EQUAL.value
-    ):
-        raise ValueError(
-            """
-            For categorical columns,
-            only the `==` operator is supported.
-            """
-        )
-
-    return None
-
-
-def _generic_func_cond_join(
-    df: pd.DataFrame,
-    right: pd.DataFrame,
-    left_on: Union[str, list],
-    right_on: Union[str, list],
-    op: str,
-    join_type: str,
-):
-    """
-    Generic function to call any of the individual functions
-    (_less_than_indices, _greater_than_indices, _equal_indices,
-    or _not_equal_indices).
-    """
-    strict = False
-
-    if op in {
-        _JoinOperator.GREATER_THAN.value,
-        _JoinOperator.LESS_THAN.value,
-        _JoinOperator.NOT_EQUAL.value,
-    }:
-        strict = True
-
-    if op in less_than_join_types:
-        return _less_than_indices(
-            df, right, left_on, right_on, strict, join_type
-        )
-    elif op in greater_than_join_types:
-        return _greater_than_indices(
-            df, right, left_on, right_on, strict, join_type
-        )
-    elif op == _JoinOperator.NOT_EQUAL.value:
-        return _not_equal_indices(df, right, left_on, right_on)
-    else:
-        return _equal_indices(df, right, left_on, right_on)
-
-
-def _multiple_conditional_join_ne(
-    df: pd.DataFrame, right: pd.DataFrame, conditions: list
-) -> tuple:
-    """
-    Get indices for multiple conditions,
-    where all the operators are `!=`.
-
-    Returns a tuple of (df_index, right_index)
-    """
-
-    first, *rest = conditions
-    left_on, right_on, op = first
-    result = _generic_func_cond_join(
-        df, right, left_on, right_on, op, "single"
-    )
-    if result is None:
-        return None
-
-    df_index, right_index = result
-
-    mask = None
-    for left_on, right_on, op in rest:
-        left_c = extract_array(df[left_on], extract_numpy=True)
-        left_c = left_c[df_index]
-        right_c = extract_array(right[right_on], extract_numpy=True)
-        right_c = right_c[right_index]
-        op = operator_map[op]
-
-        if mask is None:
-            mask = op(left_c, right_c)
-        else:
-            mask &= op(left_c, right_c)
-
-    if not mask.any():
-        return None
-
-    if mask.all():
-        return df_index, right_index
-
-    if is_extension_array_dtype(mask):
-        mask = mask.to_numpy(dtype=bool, na_value=False)
-
-    return df_index[mask], right_index[mask]
-
-
-def _multiple_conditional_join_eq(
-    df: pd.DataFrame, right: pd.DataFrame, conditions: list
-) -> tuple:
-    """
-    Get indices for multiple conditions,
-    if any of the conditions has an `==` operator.
-
-    Returns a tuple of (df_index, right_index)
-    """
-
-    eq_cond = [
-        cond
-        for cond in conditions
-        if cond[-1] == _JoinOperator.STRICTLY_EQUAL.value
-    ]
-    rest = [
-        cond
-        for cond in conditions
-        if cond[-1] != _JoinOperator.STRICTLY_EQUAL.value
-    ]
-
-    left_on, right_on, _ = zip(*eq_cond)
-
-    result = _generic_func_cond_join(
-        df,
-        right,
-        [*left_on],
-        [*right_on],
-        _JoinOperator.STRICTLY_EQUAL.value,
-        "single",
-    )
-
-    if result is None:
-        return None
-
-    if not rest:
-        return result
-
-    df_index, right_index = result
-
-    # non-equi conditions are present
-    mask = None
-    for left_on, right_on, op in rest:
-        left_c = extract_array(df[left_on], extract_numpy=True)
-        left_c = left_c[df_index]
-        right_c = extract_array(right[right_on], extract_numpy=True)
-        right_c = right_c[right_index]
-        op = operator_map[op]
-
-        if mask is None:
-            mask = op(left_c, right_c)
-        else:
-            mask &= op(left_c, right_c)
-
-    if not mask.any():
-        return None
-
-    if mask.all():
-        return df_index, right_index
-
-    if is_extension_array_dtype(mask):
-        mask = mask.to_numpy(dtype=bool, na_value=False)
-
-    return df_index[mask], right_index[mask]
-
-
-def _multiple_conditional_join_le_lt(
-    df: pd.DataFrame, right: pd.DataFrame, conditions: list
-) -> tuple:
-    """
-    Get indices for multiple conditions,
-    where `>/>=` or `</<=` is present,
-    and there is no `==` operator.
-
-    Returns a tuple of (df_index, right_index)
-    """
-
-    check1 = len(conditions) == 2
-    check2 = (conditions[0][-1] in less_than_join_types) & (
-        conditions[-1][-1] in greater_than_join_types
-    )
-    check3 = (conditions[0][-1] in greater_than_join_types) & (
-        conditions[-1][-1] in less_than_join_types
-    )
-    if check1 & (check2 | check3):
-        (
-            (start_left, end_left),
-            (start_right, end_right),
-            (left_op, right_op),
-        ) = zip(*conditions)
-        if check2:
-            start_left, end_left = end_left, start_left
-            start_right, end_right = end_right, start_right
-            left_op, right_op = right_op, left_op
-        return _range_indices(
-            df,
-            right,
-            start_left,
-            end_left,
-            start_right,
-            end_right,
-            left_op,
-            right_op,
-        )
-
-    # find minimum df_index and right_index
-    # aim is to reduce search space
-    df_index = df.index
-    right_index = right.index
-    arrs = []
-    for left_on, right_on, op in conditions:
-        # no point checking for `!=`, since best case scenario
-        # they'll have the same no of rows as the other operators
-        if op == _JoinOperator.NOT_EQUAL.value:
-            continue
-
-        result = _generic_func_cond_join(
-            df.loc[df_index],
-            right.loc[right_index],
-            left_on,
-            right_on,
-            op,
-            join_type="multiple",
-        )
-
-        if result is None:
-            return None
-
-        df_index, right_index, arr, lengths = result
-        arrs.append((df_index, arr, lengths))
-
-    new_arrs = []
-
-    # trim to the minimum index for df
-    # and the smallest indices for right
-    # the minimum index for df should be available
-    # to all conditions; we achieve this via boolean indexing
-    for l_index, r_index, repeats in arrs:
-        bools = np.isin(l_index, df_index)
-        if not np.all(bools):
-            l_index = l_index[bools]
-            r_index = compress(r_index, bools)
-            repeats = repeats[bools]
-        new_arrs.append((l_index, r_index, repeats))
-    _, arr, repeats = zip(*new_arrs)
-
-    # with the aim of reducing the search space
-    # we get the smallest indices for each index in df
-    # e.g if df_index is [1, 2, 3]
-    # and there are two outcomes for the conditions for right:
-    # [[1,2,3], [4]], [[2], [4, 6]]
-    # the reconstituted indices will be the smallest per pairing
-    # which turns out to : [ [2], [4]]
-    # we achieve this by getting the minimum size in `repeats`
-    # and use that to index into `arr`
-    repeats = np.vstack(repeats)
-    positions = np.argmin(repeats, axis=0)
-    repeats = np.minimum.reduce(repeats)
-    arrays = []
-    arr = zip(*arr)  # pair all the indices for right obtained per condition
-    for row, pos in zip(arr, positions):
-        arrays.append(row[pos])
-    right_index = np.concatenate(arrays)
-    df_index = df_index.repeat(repeats)
-
-    mask = None
-    for left_on, right_on, op in conditions:
-        left_c = extract_array(df[left_on], extract_numpy=True)
-        left_c = left_c[df_index]
-        right_c = extract_array(right[right_on], extract_numpy=True)
-        right_c = right_c[right_index]
-        op = operator_map[op]
-
-        if mask is None:
-            mask = op(left_c, right_c)
-        else:
-            mask &= op(left_c, right_c)
-
-    if not mask.any():
-        return None
-
-    if mask.all():
-        return df_index, right_index
-
-    if is_extension_array_dtype(mask):
-        mask = mask.to_numpy(dtype=bool, na_value=False)
-
-    return df_index[mask], right_index[mask]
-
-
-def _create_conditional_join_empty_frame(
-    df: pd.DataFrame, right: pd.DataFrame, how: str
-):
-    """
-    Create final dataframe for conditional join,
-    if there are no matches.
-    """
-
-    if set(df.columns).intersection(right.columns):
-        df.columns = pd.MultiIndex.from_product([["left"], df.columns])
-        right.columns = pd.MultiIndex.from_product([["right"], right.columns])
-
-    if how == _JoinTypes.INNER.value:
-        df = df.dtypes.to_dict()
-        right = right.dtypes.to_dict()
-        df = {**df, **right}
-        df = {key: pd.Series([], dtype=value) for key, value in df.items()}
-        return pd.DataFrame(df)
-
-    if how == _JoinTypes.LEFT.value:
-        right = right.dtypes.to_dict()
-        right = {
-            key: float if dtype.kind == "i" else dtype
-            for key, dtype in right.items()
-        }
-        right = {
-            key: pd.Series([], dtype=value) for key, value in right.items()
-        }
-        right = pd.DataFrame(right)
-        return df.join(right, how=how, sort=False)
-
-    if how == _JoinTypes.RIGHT.value:
-        df = df.dtypes.to_dict()
-        df = {
-            key: float if dtype.kind == "i" else dtype
-            for key, dtype in df.items()
-        }
-        df = {key: pd.Series([], dtype=value) for key, value in df.items()}
-        df = pd.DataFrame(df)
-        return df.join(right, how=how, sort=False)
-
-
-def _create_conditional_join_frame(
-    df: pd.DataFrame,
-    right: pd.DataFrame,
-    left_index: pd.Index,
-    right_index: pd.Index,
-    how: str,
-    sort_by_appearance: bool,
-):
-    """
-    Create final dataframe for conditional join,
-    if there are matches.
-    """
-    if sort_by_appearance:
-        sorter = np.lexsort((right_index, left_index))
-        right_index = right_index[sorter]
-        left_index = left_index[sorter]
-        sorter = None
-
-    if set(df.columns).intersection(right.columns):
-        df.columns = pd.MultiIndex.from_product([["left"], df.columns])
-        right.columns = pd.MultiIndex.from_product([["right"], right.columns])
-
-    if how == _JoinTypes.INNER.value:
-        df = {
-            key: extract_array(value, extract_numpy=True)[left_index]
-            for key, value in df.items()
-        }
-        right = {
-            key: extract_array(value, extract_numpy=True)[right_index]
-            for key, value in right.items()
-        }
-        return pd.DataFrame({**df, **right})
-
-    if how == _JoinTypes.LEFT.value:
-        right = right.loc[right_index]
-        right.index = left_index
-        return df.join(right, how=how, sort=False).reset_index(drop=True)
-
-    if how == _JoinTypes.RIGHT.value:
-        df = df.loc[left_index]
-        df.index = right_index
-        return df.join(right, how=how, sort=False).reset_index(drop=True)
-
-
-less_than_join_types = {
-    _JoinOperator.LESS_THAN.value,
-    _JoinOperator.LESS_THAN_OR_EQUAL.value,
-}
-greater_than_join_types = {
-    _JoinOperator.GREATER_THAN.value,
-    _JoinOperator.GREATER_THAN_OR_EQUAL.value,
-}
-
-
-def _check_operator(op: str):
-    """
-    Check that operator is one of
-    `>`, `>=`, `==`, `!=`, `<`, `<=`.
-
-    Used in `conditional_join`.
-    """
-    sequence_of_operators = {op.value for op in _JoinOperator}
-    if op not in sequence_of_operators:
-        raise ValueError(
-            f"""
-             The conditional join operator
-             should be one of {", ".join(sequence_of_operators)}
-             """
-        )
-
-
-def _range_indices(
-    df: pd.DataFrame,
-    right: pd.DataFrame,
-    start_left: str,
-    end_left: str,
-    start_right: str,
-    end_right: str,
-    left_op: str,
-    right_op: str,
-):
-    """
-    Retrieve index positions for a range/between join.
-
-    Idea inspired by article:
-    https://www.vertica.com/blog/what-is-a-range-join-and-why-is-it-so-fastba-p223413/
-
-    Returns a tuple of (left_index, right_index)
-    """
-
-    # summary of code:
-    # get the positions where start_left is >/>= start_right
-    # then within the positions,
-    # get the positions where end_left is </<= end_right
-    # this should reduce the search space significantly
-    strict = False
-    if left_op == _JoinOperator.GREATER_THAN.value:
-        strict = True
-
-    outcome = _greater_than_indices(
-        df, right, start_left, start_right, strict, join_type="dual"
-    )
-
-    if outcome is None:
-        return None
-
-    search_indices, right_index, left_index = outcome
-    right_c = right.loc[right_index, end_right]
-    right_c = extract_array(right_c, extract_numpy=True)
-    left_c = df.loc[left_index, end_left]
-    left_c = extract_array(left_c, extract_numpy=True)
-    top_pos = np.copy(search_indices)
-    bottom_pos = np.copy(search_indices)
-    counter = np.arange(left_index.size)
-    right_op = operator_map[right_op]
-
-    for ind in range(np.max(search_indices)):
-        # get rid of rows if it exceeds
-        # the range for the search_indices
-        # e.g search_indices is [2, 4, 6]
-        # our search space for 2( the first index)
-        # is 0, 1. if ind is 2, there is no point
-        # searching within the first index space anymore
-        exclude_rows = search_indices <= ind
-        if exclude_rows.any():
-            counter = counter[~exclude_rows]
-            search_indices = search_indices[~exclude_rows]
-            left_c = left_c[~exclude_rows]
-        keep_rows = right_op(left_c, right_c[ind])
-        # get the index positions where left_c is </<= right_c
-        # that minimum position combined with the equivalent position
-        # from search_indices becomes our search space
-        # for the equivalent left_c index
-        if keep_rows.any():
-            top_pos[counter[keep_rows]] = ind
-            counter = counter[~keep_rows]
-            search_indices = search_indices[~keep_rows]
-            left_c = left_c[~keep_rows]
-        if not counter.size > 0:
-            break
-
-    # no point searching within (a, b)
-    # if a == b
-    # since range(a, b) yields none
-    keep_rows = top_pos < bottom_pos
-
-    if not keep_rows.any():
-        return None
-
-    if not keep_rows.all():
-        left_index = left_index[keep_rows]
-        top_pos = top_pos[keep_rows]
-        bottom_pos = bottom_pos[keep_rows]
-    repeater = bottom_pos - top_pos
-    right_index = [
-        right_index[start:end] for start, end in zip(top_pos, bottom_pos)
-    ]
-    right_index = np.concatenate(right_index)
-    left_index = np.repeat(left_index, repeater)
-
-    # here we search for actual positions
-    # where left_c is </<= right_c
-    left_c = extract_array(df[end_left], extract_numpy=True)[left_index]
-    right_c = extract_array(right[end_right], extract_numpy=True)[right_index]
-
-    mask = right_op(left_c, right_c)
-
-    if not mask.any():
-        return None
-    if not mask.all():
-        return left_index[mask], right_index[mask]
-
-    return left_index, right_index
-
-
-def _less_than_indices(
-    df: pd.DataFrame,
-    right: pd.DataFrame,
-    left_on: str,
-    right_on: str,
-    strict: bool,
-    join_type: str = "single",
-) -> tuple:
-    """
-    Use binary search to get indices where left_c
-    is less than or equal to right_c.
-
-    If strict is True,then only indices
-    where `left_c` is less than
-    (but not equal to) `right_c` are returned.
-
-    Returns a tuple of (left_c, right_c)
-    """
-
-    left_c = df[left_on]
-    right_c = right[right_on]
-
-    # no point going through all the hassle
-    if left_c.min() > right_c.max():
-        return None
-
-    any_nulls = pd.isna(right_c.array)
-    if any_nulls.any():
-        right_c = right_c[~any_nulls]
-    any_nulls = pd.isna(left_c.array)
-    if any_nulls.any():
-        left_c = left_c[~any_nulls]
-
-    if not right_c.is_monotonic_increasing:
-        right_c = right_c.sort_values(kind="stable")
-
-    left_index = left_c.index.to_numpy(dtype=int, copy=False)
-    left_c = extract_array(left_c, extract_numpy=True)
-    right_index = right_c.index.to_numpy(dtype=int, copy=False)
-    right_c = extract_array(right_c, extract_numpy=True)
-
-    search_indices = right_c.searchsorted(left_c, side="left")
-    # if any of the positions in `search_indices`
-    # is equal to the length of `right_keys`
-    # that means the respective position in `left_c`
-    # has no values from `right_c` that are less than
-    # or equal, and should therefore be discarded
-    len_right = right_c.size
-    rows_equal = search_indices == len_right
-
-    if rows_equal.any():
-        left_c = left_c[~rows_equal]
-        left_index = left_index[~rows_equal]
-        search_indices = search_indices[~rows_equal]
-
-    if search_indices.size == 0:
-        return None
-
-    # the idea here is that if there are any equal values
-    # shift upwards to the immediate next position
-    # that is not equal
-    if strict:
-        rows_equal = right_c[search_indices]
-        rows_equal = left_c == rows_equal
-        # replace positions where rows are equal
-        # with positions from searchsorted('right')
-        # positions from searchsorted('right') will never
-        # be equal and will be the furthermost in terms of position
-        # example : right_c -> [2, 2, 2, 3], and we need
-        # positions where values are not equal for 2;
-        # the furthermost will be 3, and searchsorted('right')
-        # will return position 3.
-        if rows_equal.any():
-            replacements = right_c.searchsorted(left_c, side="right")
-            # now we can safely replace values
-            # with strictly less than positions
-            search_indices = np.where(rows_equal, replacements, search_indices)
-        # check again if any of the values
-        # have become equal to length of right_c
-        # and get rid of them
-        rows_equal = search_indices == len_right
-
-        if rows_equal.any():
-            left_c = left_c[~rows_equal]
-            left_index = left_index[~rows_equal]
-            search_indices = search_indices[~rows_equal]
-
-    if search_indices.size == 0:
-        return None
-
-    right_c = [right_index[ind:len_right] for ind in search_indices]
-
-    if join_type == "multiple":
-        return (
-            left_index,
-            right_index[search_indices.min() :],  # noqa: E203
-            right_c,
-            len_right - search_indices,
-        )
-
-    search_indices = len_right - search_indices
-    left_c = np.repeat(left_index, search_indices)
-    right_c = np.concatenate(right_c)
-    return left_c, right_c
-
-
-def _greater_than_indices(
-    df: pd.DataFrame,
-    right: pd.DataFrame,
-    left_on: str,
-    right_on: str,
-    strict: bool,
-    join_type: str = "single",
-) -> tuple:
-    """
-    Use binary search to get indices where left_c
-    is greater than or equal to right_c.
-
-    If strict is True,then only indices
-    where `left_c` is greater than
-    (but not equal to) `right_c` are returned.
-
-    Returns a tuple of (left_c, right_c).
-    """
-    left_c = df[left_on]
-    right_c = right[right_on]
-
-    # quick break, avoiding the hassle
-    if left_c.max() < right_c.min():
-        return None
-
-    any_nulls = pd.isna(right_c.array)
-    if any_nulls.any():
-        right_c = right_c[~any_nulls]
-    any_nulls = pd.isna(left_c.array)
-    if any_nulls.any():
-        left_c = left_c[~any_nulls]
-
-    if not right_c.is_monotonic_increasing:
-        right_c = right_c.sort_values(kind="stable")
-
-    left_index = left_c.index.to_numpy(dtype=int, copy=False)
-    left_c = extract_array(left_c, extract_numpy=True)
-    right_index = right_c.index.to_numpy(dtype=int, copy=False)
-    right_c = extract_array(right_c, extract_numpy=True)
-
-    search_indices = right_c.searchsorted(left_c, side="right")
-    # if any of the positions in `search_indices`
-    # is equal to 0 (less than 1), it implies that
-    # left_c[position] is not greater than any value
-    # in right_c
-    rows_equal = search_indices < 1
-    if rows_equal.any():
-        left_c = left_c[~rows_equal]
-        left_index = left_index[~rows_equal]
-        search_indices = search_indices[~rows_equal]
-    if search_indices.size == 0:
-        return None
-
-    # the idea here is that if there are any equal values
-    # shift downwards to the immediate next position
-    # that is not equal
-    if strict:
-        rows_equal = right_c[search_indices - 1]
-        rows_equal = left_c == rows_equal
-        # replace positions where rows are equal with
-        # searchsorted('left');
-        # however there can be scenarios where positions
-        # from searchsorted('left') would still be equal;
-        # in that case, we shift down by 1
-        if rows_equal.any():
-            replacements = right_c.searchsorted(left_c, side="left")
-            # return replacements
-            # `left` might result in values equal to len right_c
-            replacements = np.where(
-                replacements == right_c.size, replacements - 1, replacements
-            )
-            # now we can safely replace values
-            # with strictly greater than positions
-            search_indices = np.where(rows_equal, replacements, search_indices)
-        # any value less than 1 should be discarded
-        # since the lowest value for binary search
-        # with side='right' should be 1
-        rows_equal = search_indices < 1
-        if rows_equal.any():
-            left_c = left_c[~rows_equal]
-            left_index = left_index[~rows_equal]
-            search_indices = search_indices[~rows_equal]
-
-    if search_indices.size == 0:
-        return None
-
-    if join_type == "dual":
-        return search_indices, right_index, left_index
-
-    right_c = [right_index[:ind] for ind in search_indices]
-
-    if join_type == "multiple":
-        return (
-            left_index,
-            right_index[: search_indices.max()],
-            right_c,
-            search_indices,
-        )
-
-    left_c = np.repeat(left_index, search_indices)
-    right_c = np.concatenate(right_c)
-    return left_c, right_c
-
-
-def _equal_indices(
-    df: pd.DataFrame,
-    right: pd.DataFrame,
-    left_on: Union[str, list],
-    right_on: Union[str, list],
-) -> tuple:
-    """
-    Use Pandas' merge internal functions
-    to find the matches, if any.
-
-    Returns a tuple of (left_c, right_c)
-    """
-
-    # select_columns will take care of duplicates
-    exclude_rows = df.select_columns(left_on).isna().any(axis=1)
-    if exclude_rows.any(axis=None):
-        df = df.loc[~exclude_rows]
-
-    exclude_rows = right.select_columns(right_on).isna().any(axis=1)
-    if exclude_rows.any(axis=None):
-        right = right.loc[~exclude_rows]
-
-    outcome = _MergeOperation(
-        left=df,
+    df, right = _conditional_join_preliminary_checks(
+        df=df,
         right=right,
-        left_on=left_on,
-        right_on=right_on,
-        sort=False,
+        conditions=conditions,
+        how=how,
+        df_columns=df_columns,
+        right_columns=right_columns,
+        keep=keep,
+        indicator=indicator,
+        force=force,
+        return_matching_indices=return_matching_indices,
+        aggfunc=aggfunc,
+        include_join_positions=include_join_positions,
+        return_building_blocks=return_building_blocks,
+        reverse=reverse,
+        join_algorithm=join_algorithm,
+        return_matched=return_matched,
+    )
+    conditions = _normalize_conditions(conditions)
+
+    for condition in conditions:
+        _conditional_join_type_check(
+            left_column=df[condition.left],
+            right_column=right[condition.right],
+            op=condition.op,
+            force=force,
+        )
+
+    # Rust receives physical row positions, never the caller's labels.
+    df.index = pd.RangeIndex(len(df))
+    right.index = pd.RangeIndex(len(right))
+
+    if how in {"left_anti", "right_anti"}:
+        return _compute_anti_join(
+            df=df,
+            right=right,
+            conditions=conditions,
+            how=how,
+            df_columns=df_columns,
+            right_columns=right_columns,
+            indicator=indicator,
+            force=force,
+            join_algorithm=join_algorithm,
+            return_matching_indices=return_matching_indices,
+        )
+
+    index_result_kwargs = {
+        "how": how,
+        "df_columns": df_columns,
+        "right_columns": right_columns,
+        "indicator": indicator,
+        "include_join_positions": include_join_positions,
+        "return_matching_indices": return_matching_indices,
+    }
+
+    eq_check = any(
+        condition.op == _JoinOperator.STRICTLY_EQUAL.value for condition in conditions
+    )
+    has_range = any(
+        condition.op in less_than_join_types.union(greater_than_join_types)
+        for condition in conditions
+    )
+    use_equi_path = eq_check and (not force or not has_range)
+    if use_equi_path and aggfunc:
+        return _equi_join._aggregate(
+            df=df,
+            right=right,
+            conditions=conditions,
+            aggfunc=aggfunc,
+            reverse=reverse,
+            return_matched=return_matched,
+        )
+    if use_equi_path:
+        return _equi_join._compute_equi_join(
+            df=df,
+            right=right,
+            conditions=conditions,
+            keep=keep,
+            return_building_blocks=return_building_blocks,
+            **index_result_kwargs,
+        )
+
+    # All-!= predicates have their own null-aware Rust ABI. Route them before
+    # the mixed non-equi algorithms; join_algorithm is intentionally ignored
+    # because this family never enters the regions/range dispatch.
+    all_nes_check = all(condition.op == "!=" for condition in conditions)
+    if all_nes_check and aggfunc:
+        # The dedicated all-!= aggregation path returns a schema-only empty
+        # frame when no pair survives, preserving the requested index shape.
+        return _not_equals_only._aggregate(
+            df=df,
+            right=right,
+            conditions=conditions,
+            aggfunc=aggfunc,
+            reverse=reverse,
+            return_matched=return_matched,
+        )
+    if all_nes_check and return_building_blocks:
+        return _not_equals_only._compute_not_equals_join(
+            df=df,
+            right=right,
+            conditions=conditions,
+            keep="all",
+            return_building_blocks=return_building_blocks,
+            **index_result_kwargs,
+        )
+    if all_nes_check:
+        return _not_equals_only._compute_not_equals_join(
+            df=df,
+            right=right,
+            conditions=conditions,
+            keep=keep,
+            return_building_blocks=return_building_blocks,
+            **index_result_kwargs,
+        )
+    single_join_check = len(conditions) == 1
+    if single_join_check and aggfunc:
+        return _single_range_predicate._aggregate_single_join(
+            df=df,
+            right=right,
+            condition=conditions[0],
+            aggfunc=aggfunc,
+            return_matched=return_matched,
+            reverse=reverse,
+        )
+    if single_join_check:
+        return _single_range_predicate._compute_single_range_join(
+            df=df,
+            right=right,
+            condition=conditions[0],
+            keep=keep,
+            return_building_blocks=return_building_blocks,
+            **index_result_kwargs,
+        )
+    counter = 0
+    for condition in conditions:
+        if condition.op not in less_than_join_types.union(greater_than_join_types):
+            continue
+        counter += 1
+    # A join with exactly one range predicate uses the range-first Rust
+    # boundary even when residual predicates are present. The first range
+    # owns the sorted right search layout; residuals are filtered inside Rust
+    # before keep/aggregation semantics are applied.
+    if (counter == 1) and aggfunc:
+        return _single_range_predicate._aggregate_multiple_join(
+            df=df,
+            right=right,
+            conditions=conditions,
+            aggfunc=aggfunc,
+            return_matched=return_matched,
+            reverse=reverse,
+        )
+    if (counter == 1) and return_building_blocks:
+        return _single_range_predicate._compute_multi_range_join(
+            df=df,
+            right=right,
+            conditions=conditions,
+            keep="all",
+            return_building_blocks=return_building_blocks,
+            **index_result_kwargs,
+        )
+    if counter == 1:
+        return _single_range_predicate._compute_multi_range_join(
+            df=df,
+            right=right,
+            conditions=conditions,
+            keep=keep,
+            return_building_blocks=return_building_blocks,
+            **index_result_kwargs,
+        )
+
+    if (counter > 1) and (join_algorithm == "regions") and aggfunc:
+        return _regions._aggregate(
+            df=df,
+            right=right,
+            conditions=conditions,
+            aggfunc=aggfunc,
+            return_matched=return_matched,
+            reverse=reverse,
+        )
+    if (counter > 1) and (join_algorithm == "regions"):
+        return _regions._compute_regions_join(
+            df=df,
+            right=right,
+            conditions=conditions,
+            keep=keep,
+            return_building_blocks=return_building_blocks,
+            **index_result_kwargs,
+        )
+
+    if (counter > 1) and aggfunc and (join_algorithm == "default"):
+        return _multi_range_join._aggregate(
+            df=df,
+            right=right,
+            conditions=conditions,
+            aggfunc=aggfunc,
+            return_matched=return_matched,
+            reverse=reverse,
+        )
+    if (counter > 1) and (join_algorithm == "default"):
+        return _multi_range_join._compute_multi_range_join(
+            df=df,
+            right=right,
+            conditions=conditions,
+            keep=keep,
+            return_building_blocks=return_building_blocks,
+            **index_result_kwargs,
+        )
+
+    raise RuntimeError(
+        "conditional_join reached an unsupported predicate dispatch combination"
     )
 
-    left_index, right_index = outcome._get_join_indexers()
-    left_c = df.index.to_numpy(dtype=int, copy=False)
-    right_c = right.index.to_numpy(dtype=int, copy=False)
 
-    if not left_index.size > 0:
-        return None
-
-    return left_c[left_index], right_c[right_index]
-
-
-def _not_equal_indices(
+@deprecated_kwargs("return_ragged_arrays")
+def get_join_indices(
     df: pd.DataFrame,
-    right: pd.DataFrame,
-    left_on: str,
-    right_on: str,
-) -> tuple:
+    right: pd.DataFrame | pd.Series,
+    *conditions: tuple,
+    keep: Literal["first", "last", "any", "all"] = "all",
+    use_numba: bool | None = None,
+    force: bool = False,
+    return_building_blocks: bool = False,
+    join_algorithm: str = "default",
+) -> dict:
+    """Return matching physical positions for an inner conditional join.
+
+    Unlike [`conditional_join`][janitor.functions.conditional_join], this
+    helper does not gather dataframe rows. It returns two parallel arrays of
+    zero-based physical positions. At position ``i``,
+    ``left_index[i]`` and ``right_index[i]`` identify one matching pair.
+
+    The result is useful when callers need to materialize rows or perform
+    additional processing themselves.
+
+    !!! info "New in version 0.27.0"
+
+    !!! abstract "Version changed"
+
+        - **0.29.0:** Added support for ragged array indices.
+        - **0.32.0:** Deprecated ragged array indices and changed the return
+          value to a dictionary.
+        - **0.32.9:** Deprecated ``use_numba``.
+        - **0.32.10:** Added the experimental ``return_building_blocks`` and
+          ``join_algorithm`` parameters.
+
+    !!! warning "Experimental parameter"
+
+        ``return_building_blocks=True`` may add implementation-level values,
+        such as range-window ``starts`` and ``ends``, to the result. The keys
+        and shape of this additional data are not part of the stable public
+        API.
+
+    Args:
+        df: Left DataFrame.
+        right: Right DataFrame or named Series.
+        conditions: Predicates of the form
+            ``(left_column, right_column, operator)``. The supported operators
+            are ``==``, ``!=``, ``<``, ``<=``, ``>``, and ``>=``.
+        keep: Return all matches, or one ``first``, ``last``, or ``any`` match
+            per left row.
+        use_numba: Deprecated no-op retained for compatibility with older
+            callers. Its value is ignored.
+        force: If ``True``, force mixed equality/range joins to use the
+            non-equi path. Range predicates drive candidate generation before
+            equality predicates are applied. It has no effect on joins that
+            mix equality and ``!=`` predicates without a range predicate.
+        return_building_blocks: If ``True``, include implementation-level
+            values in the result.
+            !!! warning "Experimental"
+                This parameter may add range-window ``starts`` and ``ends``
+                to the result. The keys and shape of this data are not part
+                of the stable public API and may change without warning.
+        join_algorithm: Strategy for multiple range predicates. ``"default"``
+            uses the general range-join implementation and ``"regions"`` uses
+            the region-based implementation. It is ignored for other joins.
+
+    Returns:
+        dict: Matching physical-position arrays and optional building blocks.
+
+    !!! note "Return layout"
+
+        - ``left_index`` and ``right_index`` are one-dimensional NumPy arrays
+          of zero-based physical row positions from ``df`` and ``right``.
+        - The arrays have equal length; values at position ``i`` form one
+          matching pair.
+        - ``keep="all"`` returns every pair. ``keep="first"``, ``"last"``,
+          and ``"any"`` return at most one pair per left row.
+        - When there are no matches, both required arrays are empty.
+        - ``return_building_blocks=True`` may add experimental arrays such as
+          ``starts`` and ``ends``. Their keys and shape are not stable.
+
+    Examples:
+        >>> import pandas as pd
+        >>> import janitor
+        >>> left = pd.DataFrame({"value": [1, 4, 7]})
+        >>> right = pd.DataFrame({"value": [2, 5, 8]})
+        >>> janitor.get_join_indices(left, right, ("value", "value", "<"), keep="first")
+        {'left_index': array([0, 1, 2]), 'right_index': array([0, 1, 2])}
+
+        With ``keep="all"`` (the default), every matching pair is returned:
+
+        >>> all_matches = janitor.get_join_indices(left, right, ("value", "value", "<"))
+        >>> all_matches["left_index"].tolist()
+        [0, 0, 0, 1, 1, 2]
+        >>> all_matches["right_index"].tolist()
+        [0, 1, 2, 1, 2, 2]
+
+        ``return_building_blocks`` is experimental and exposes implementation
+        details—the range windows used by callers that need to perform their
+        own materialization:
+
+        >>> blocks = janitor.get_join_indices(
+        ...     left,
+        ...     right,
+        ...     ("value", "value", "<"),
+        ...     return_building_blocks=True,
+        ... )
+        >>> sorted(blocks)
+        ['ends', 'left_index', 'right_index', 'starts']
     """
-    Use binary search to get indices where
-    `left_c` is exactly  not equal to `right_c`.
+    if use_numba is not None:
+        warnings.warn(
+            "The 'use_numba' parameter is deprecated and has no effect.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
-    It is a combination of strictly less than
-    and strictly greater than indices.
-
-    Returns a tuple of (left_c, right_c)
-    """
-
-    dummy = np.array([], dtype=int)
-
-    outcome = _less_than_indices(
-        df, right, left_on, right_on, True, join_type="single"
+    return _conditional_join_compute(
+        df=df,
+        right=right,
+        conditions=conditions,
+        how="inner",
+        df_columns=None,
+        right_columns=None,
+        keep=keep,
+        indicator=False,
+        force=force,
+        return_matching_indices=True,
+        aggfunc=None,
+        include_join_positions=False,
+        return_building_blocks=return_building_blocks,
+        reverse=False,
+        join_algorithm=join_algorithm,
     )
 
-    if outcome is None:
-        lt_left = dummy
-        lt_right = dummy
-    else:
-        lt_left, lt_right = outcome
 
-    outcome = _greater_than_indices(
-        df, right, left_on, right_on, True, join_type="single"
+@pf.register_dataframe_method
+def join_agg(
+    df: pd.DataFrame,
+    right: pd.DataFrame | pd.Series,
+    *conditions,
+    aggfunc: list[tuple],
+    force: bool = False,
+    reverse: bool = False,
+    return_matched: bool = True,
+    join_algorithm: str = "default",
+) -> pd.DataFrame:
+    """Aggregate values over rows matched by an inner conditional join.
+
+    ``aggfunc`` contains ``(column, operation)`` pairs. Supported operations
+    are ``sum``, ``prod``, ``size``, ``count``, ``min``, and ``max``.
+
+    !!! info "Aggregation semantics"
+
+        | Operation | Match and null behavior |
+        | --- | --- |
+        | `count` | Counts matched, non-null source values. |
+        | `size` | Counts every matched source row, including null values. |
+        | `sum` | Ignores nulls; uses `0` when no value contributes. |
+        | `prod` | Ignores nulls; uses `1` when no value contributes. |
+        | `min`, `max` | Ignore nulls; missing if no non-null value contributes. |
+
+    !!! note "Dtypes and match status"
+
+        - `sum` and `prod` require numeric source columns. Signed integer
+          results use `int64`; unsigned results use `uint64`.
+        - `min` and `max` support numeric, datetime, and timedelta columns.
+          Integer results use nullable `Int64` or `UInt64` when an unmatched
+          output row needs `pd.NA`; other results retain their source dtype.
+        - `return_matched` identifies whether any row pair matched. This is
+          independent of `count`, which can be zero when all matched source
+          values are null.
+
+    By default, right-side values are aggregated for each left row. Set
+    ``reverse=True`` to aggregate left-side values for each right row.
+
+    !!! note "Output and matching"
+
+        The output contains one row for every eligible physical row on the
+        output side. Rows with null values in any join-condition column are
+        excluded. Eligible rows with no matching partner are retained with
+        identity values and ``matched=False``. With ``return_matched=True``,
+        the result index has a boolean ``matched`` level so identity-valued
+        unmatched results can be distinguished from matched results with the
+        same value.
+
+    Args:
+        df: Left DataFrame and reverse-aggregation source.
+        right: Right DataFrame or named Series and forward-aggregation source.
+        conditions: Conditional-join predicate tuples.
+        aggfunc: Non-empty ``(column, operation)`` requests.
+        force: If ``True``, force mixed equality/range joins to use the
+            non-equi path. Range predicates drive candidate generation before
+            equality predicates are applied. It has no effect on joins that
+            mix equality and ``!=`` predicates without a range predicate.
+        reverse: Aggregate left-side values into right-side output rows.
+        return_matched: Add a boolean ``matched`` level to the result index.
+        join_algorithm: Strategy for multiple range predicates. ``"default"``
+            uses the general range-join implementation and ``"regions"`` uses
+            the region-based implementation. It is ignored for other joins.
+
+    Returns:
+        pd.DataFrame: Aggregated values with one row per eligible physical
+        output row. Null join-key rows are excluded; eligible unmatched rows
+        are retained with identity values.
+
+    Examples:
+        >>> import pandas as pd
+        >>> import janitor
+        >>> left = pd.DataFrame({"key": [1, 2]})
+        >>> right = pd.DataFrame({"key": [1, 2, 3], "amount": [10, 20, 30]})
+        >>> result = left.join_agg(
+        ...     right,
+        ...     ("key", "key", "<"),
+        ...     aggfunc=[("amount", "sum"), ("amount", "count")],
+        ...     return_matched=True,
+        ... )
+        >>> print(result.to_string())  # doctest: +NORMALIZE_WHITESPACE
+                  amount
+                     sum count
+              matched
+        0 True        50     2
+        1 True        30     1
+
+        ``return_matched`` also distinguishes an unmatched row from a matched
+        row whose aggregate happens to be zero:
+
+        >>> left = pd.DataFrame({"key": [1, 3]})
+        >>> right = pd.DataFrame({"key": [2, 3], "amount": [5, 7]})
+        >>> partial = left.join_agg(
+        ...     right,
+        ...     ("key", "key", "<"),
+        ...     aggfunc=[("amount", "sum")],
+        ...     return_matched=True,
+        ... )
+        >>> print(partial.to_string())  # doctest: +NORMALIZE_WHITESPACE
+                  amount
+                     sum
+              matched
+        0 True        12
+        1 False        0
+
+        The same contract applies when no eligible row matches anywhere in
+        the call:
+
+        >>> left = pd.DataFrame({"key": [1, 2]})
+        >>> right = pd.DataFrame({"key": [3], "amount": [10]})
+        >>> all_unmatched = left.join_agg(
+        ...     right,
+        ...     ("key", "key", ">"),
+        ...     aggfunc=[("amount", "sum"), ("amount", "prod")],
+        ...     return_matched=True,
+        ... )
+        >>> print(all_unmatched.to_string())  # doctest: +NORMALIZE_WHITESPACE
+                  amount
+                     sum prod
+              matched
+        0 False         0    1
+        1 False         0    1
+
+        Set ``reverse=True`` to aggregate left-side values into right-side
+        output rows:
+
+        >>> left = pd.DataFrame({"key": [1, 2], "amount": [10, 20]})
+        >>> right = pd.DataFrame({"key": [1, 2, 3]})
+        >>> reverse_result = left.join_agg(
+        ...     right,
+        ...     ("key", "key", "<"),
+        ...     aggfunc=[("amount", "sum")],
+        ...     reverse=True,
+        ...     return_matched=False,
+        ... )
+        >>> print(reverse_result.to_string())
+          amount
+             sum
+        0      0
+        1     10
+        2     30
+    """
+    return _conditional_join_compute(
+        df=df,
+        right=right,
+        conditions=conditions,
+        how="inner",
+        df_columns=None,
+        right_columns=None,
+        keep="all",
+        indicator=False,
+        force=force,
+        return_matching_indices=False,
+        aggfunc=aggfunc,
+        return_matched=return_matched,
+        reverse=reverse,
+        join_algorithm=join_algorithm,
     )
-
-    if outcome is None:
-        gt_left = dummy
-        gt_right = dummy
-    else:
-        gt_left, gt_right = outcome
-
-    if (not lt_left.size > 0) and (not gt_left.size > 0):
-        return None
-    left_c = np.concatenate([lt_left, gt_left])
-    right_c = np.concatenate([lt_right, gt_right])
-
-    return left_c, right_c

@@ -115,7 +115,7 @@ ENV/
 # Custom
 .pytest_cache
 
-# Ingore docs' symbolic link to notebooks
+# Ignore docs' symbolic link to notebooks
 docs/notebooks
 docs/*
 
@@ -142,3 +142,5 @@ tags
 # Other stuff
 *.profraw
 /scratch.py
+midpoint.csv
+examples/notebooks/cond_join.ipynb

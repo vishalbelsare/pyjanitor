@@ -6,6 +6,8 @@ import pytest
 
 from janitor.testing_utils import date_data
 
+os.environ["PYARROW_IGNORE_TIMEZONE"] = "1"
+
 TEST_DATA_DIR = "tests/test_data"
 EXAMPLES_DIR = "examples/"
 
@@ -31,9 +33,7 @@ def multilevel_dataframe():
     ]
     tuples = list(zip(*arrays))
     index = pd.MultiIndex.from_tuples(tuples, names=["first", "second"])
-    df = pd.DataFrame(
-        np.random.randn(3, 8), index=["A", "B", "C"], columns=index
-    )
+    df = pd.DataFrame(np.random.randn(3, 8), index=["A", "B", "C"], columns=index)
     return df
 
 

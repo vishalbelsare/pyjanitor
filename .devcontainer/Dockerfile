@@ -16,7 +16,7 @@ ARG USERNAME=vscode
 ARG USER_UID=1000
 ARG USER_GID=$USER_UID
 
-# Copy environment-dev.yml (if found) to a temp locaition so we update the environment. Also
+# Copy environment-dev.yml (if found) to a temp location so we update the environment. Also
 # copy "noop.txt" so the COPY instruction does not fail if no environment-dev.yml exists.
 COPY environment-dev.yml* .devcontainer/noop.txt /tmp/conda-tmp/
 
@@ -25,11 +25,11 @@ RUN apt-get update \
     && apt-get -y install --no-install-recommends apt-utils dialog 2>&1 \
     #
     # Verify git, process tools, lsb-release (common in install instructions for CLIs) installed
-    && apt-get -y install git openssh-client less iproute2 procps iproute2 lsb-release \
+    && apt-get -y install git openssh-client less iproute2 procps iproute2 lsb-release gcc build-essential \
     #
     # Install pylint
     && /opt/conda/bin/pip install pylint \
-    && /opt/conda/bin/conda install mamba -c conda-forge \
+    && /opt/conda/bin/conda install mamba gh -c conda-forge \
     #
     # Update Python environment based on environment-dev.yml (if present)
     && if [ -f "/tmp/conda-tmp/environment-dev.yml" ]; then /opt/conda/bin/mamba env update -n base -f /tmp/conda-tmp/environment-dev.yml; fi \

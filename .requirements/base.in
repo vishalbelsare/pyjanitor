@@ -3,6 +3,7 @@
 # lxml
 natsort
 # seaborn
+janitor_rs
 pandas_flavor
 multipledispatch
 scipy

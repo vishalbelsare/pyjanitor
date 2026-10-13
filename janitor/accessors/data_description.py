@@ -1,6 +1,9 @@
+"""DataDescription class for the DataDescription accessor."""
+
 from typing import Dict, List, Union
-import pandas_flavor as pf
+
 import pandas as pd
+import pandas_flavor as pf
 
 
 @pf.register_dataframe_accessor("data_description")
@@ -10,12 +13,29 @@ class DataDescription:
     This is a custom data accessor.
     """
 
+    # Key used to store descriptions in DataFrame.attrs, which persists
+    # across accessor instantiations (pandas 3.0+ no longer caches
+    # accessor instances).
+    _ATTRS_KEY = "_data_description_desc"
+
     def __init__(self, data):
-        """Initialize DataDescription class."""
         self._data = data
-        self._desc = {}
+
+    @property
+    def _desc(self) -> dict:
+        """Get descriptions from DataFrame.attrs for persistence."""
+        return self._data.attrs.get(self._ATTRS_KEY, {})
+
+    @_desc.setter
+    def _desc(self, value: dict):
+        """Store descriptions in DataFrame.attrs for persistence."""
+        self._data.attrs[self._ATTRS_KEY] = value
 
     def _get_data_df(self) -> pd.DataFrame:
+        """Get a table of descriptive information in a DataFrame format.
+
+        :returns: A DataFrame containing the descriptive information.
+        """
         df = self._data
 
         data_dict = {}
@@ -43,9 +63,12 @@ class DataDescription:
     def set_description(self, desc: Union[List, Dict]):
         """Update the description for each of the columns in the DataFrame.
 
-        :param desc: The structure containing the descriptions to update
-        :raises ValueError: if length of description list does not match
-            number of columns in DataFrame.
+        Args:
+            desc: The structure containing the descriptions to update
+
+        Raises:
+            ValueError: If length of description list does not match
+                number of columns in DataFrame.
         """
         if isinstance(desc, list):
             if len(desc) != len(self._data.columns):

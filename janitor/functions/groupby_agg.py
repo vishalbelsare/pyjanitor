@@ -1,87 +1,112 @@
-from typing import Callable, List, Union
-import pandas_flavor as pf
-import pandas as pd
+"""Implementation source for `groupby_agg`."""
 
-from janitor.utils import deprecated_alias
+from typing import Callable, List, Union
+
+import pandas as pd
+import pandas_flavor as pf
+
+from janitor.utils import deprecated_alias, refactored_function
 
 
 @pf.register_dataframe_method
 @deprecated_alias(new_column="new_column_name", agg_column="agg_column_name")
+@refactored_function(
+    message=(
+        "This function will be deprecated in a 1.x release. "
+        "Please use `janitor.transform_column` instead."
+    )
+)
 def groupby_agg(
     df: pd.DataFrame,
-    by: Union[List, str],
+    by: Union[List, Callable, str],
     new_column_name: str,
     agg_column_name: str,
     agg: Union[Callable, str],
     dropna: bool = True,
 ) -> pd.DataFrame:
-    """
-    Shortcut for assigning a groupby-transform to a new column.
+    """Shortcut for assigning a groupby-transform to a new column.
 
     This method does not mutate the original DataFrame.
 
-    Without this function, we would have to write a verbose line:
+    Intended to be the method-chaining equivalent of:
 
     ```python
-        df = df.assign(...=df.groupby(...)[...].transform(...))
+    df = df.assign(...=df.groupby(...)[...].transform(...))
     ```
 
-    Now, this function can be method-chained:
+    !!!note
 
-    ```python
-        import pandas as pd
-        import janitor
-        df = pd.DataFrame(...).groupby_agg(by='group',
-                                           agg='mean',
-                                           agg_column_name="col1"
-                                           new_column_name='col1_mean_by_group',
-                                           dropna = True/False)
-    ```
+        This function will be deprecated in a 1.x release.
+        Please use
+        [`jn.transform_column`][janitor.functions.transform_columns.transform_column]
+        instead.
 
-    Functional usage syntax:
+    Examples:
+        Basic usage.
 
-    ```python
+        >>> import pandas as pd
+        >>> import janitor
+        >>> df = pd.DataFrame(
+        ...     {
+        ...         "item": ["shoe", "shoe", "bag", "shoe", "bag"],
+        ...         "quantity": [100, 120, 75, 200, 25],
+        ...     }
+        ... )
+        >>> df.groupby_agg(
+        ...     by="item",
+        ...     agg="mean",
+        ...     agg_column_name="quantity",
+        ...     new_column_name="avg_quantity",
+        ... )
+           item  quantity  avg_quantity
+        0  shoe       100         140.0
+        1  shoe       120         140.0
+        2   bag        75          50.0
+        3  shoe       200         140.0
+        4   bag        25          50.0
 
-        import pandas as pd
-        import janitor as jn
+        Set `dropna=False` to compute the aggregation, treating the null
+        values in the `by` column as an isolated "group".
 
-        jn.groupby_agg(
-            df,
-            by= column name/list of column names,
-            agg=aggregation function,
-            agg_column_name = col,
-            new_column_name= new column name,
-            dropna = True/False)
-    ```
+        >>> import pandas as pd
+        >>> import janitor
+        >>> df = pd.DataFrame(
+        ...     {
+        ...         "x": ["a", "a", None, "b"],
+        ...         "y": [9, 9, 9, 9],
+        ...     }
+        ... )
+        >>> df.groupby_agg(
+        ...     by="x",
+        ...     agg="count",
+        ...     agg_column_name="y",
+        ...     new_column_name="y_count",
+        ...     dropna=False,
+        ... )
+              x  y  y_count
+        0     a  9        2
+        1     a  9        2
+        2   NaN  9        1
+        3     b  9        1
 
-    Method chaining usage syntax:
+    Args:
+        df: A pandas DataFrame.
+        by: Column(s) to groupby on, will be passed into `DataFrame.groupby`.
+        new_column_name: Name of the aggregation output column.
+        agg_column_name: Name of the column to aggregate over.
+        agg: How to aggregate.
+        dropna: Whether or not to include null values, if present in the
+            `by` column(s). Default is True (null values in `by` are assigned NaN in
+            the new column).
 
-    ```python
-
-        df.groupby_agg(
-            by= column name/list of column names,
-            agg=aggregation function,
-            agg_column_name = col,
-            new_column_name= new column name,
-            dropna = True/False)
-    ```
-
-
-    :param df: A pandas DataFrame.
-    :param by: Column(s) to groupby on, either a `str` or
-               a `list` of `str`
-    :param new_column_name: Name of the aggregation output column.
-    :param agg_column_name: Name of the column to aggregate over.
-    :param agg: How to aggregate.
-    :param dropna: Whether or not to include null values,
-        if present in the `by` column(s). Default is True.
-    :returns: A pandas DataFrame.
-    """
+    Returns:
+        A pandas DataFrame.
+    """  # noqa: E501
 
     return df.assign(
         **{
-            new_column_name: df.groupby(by, dropna=dropna)[
-                agg_column_name
-            ].transform(agg)
+            new_column_name: df.groupby(by, dropna=dropna)[agg_column_name].transform(
+                agg
+            ),
         }
     )

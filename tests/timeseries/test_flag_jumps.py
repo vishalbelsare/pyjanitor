@@ -14,7 +14,7 @@ from janitor.timeseries import _flag_jumps_single_col
 @pytest.fixture
 def timeseries_dataframe() -> pd.DataFrame:
     """Returns a time series dataframe."""
-    ts_index = pd.date_range("1/1/2019", periods=10, freq="1H")
+    ts_index = pd.date_range("1/1/2019", periods=10, freq="1h")
     c1 = [*range(10)]
     c2 = [*range(100, 110)]
     c3 = c1[::-1]
@@ -175,9 +175,7 @@ def test__flag_jumps_single_col_absolute_scale_inverse_direction(
 
 @pytest.mark.timeseries
 @pytest.mark.parametrize("col", ("col1", "col2", "col3", "col4", "col5"))
-def test__flag_jumps_single_col_absolute_scale_any_direction(
-    timeseries_dataframe, col
-):
+def test__flag_jumps_single_col_absolute_scale_any_direction(timeseries_dataframe, col):
     """
     Test utility function for flagging jumps with absolute scale.
     Here, the any `direction` is provided so should flag everything.
@@ -221,12 +219,8 @@ def test__flag_jumps_single_col_absolute_scale_flags_large_jump(
 
     # Verify
     np.testing.assert_array_equal(result_incr.array, [0] * 10)
-    np.testing.assert_array_equal(
-        result_decr.array, [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
-    )
-    np.testing.assert_array_equal(
-        result_any.array, [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
-    )
+    np.testing.assert_array_equal(result_decr.array, [0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+    np.testing.assert_array_equal(result_any.array, [0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
 
     # Cleanup - none necessary
 
@@ -358,15 +352,9 @@ def test__flag_jumps_single_col_percentage_scale_flags_large_jump(
     )
 
     # Verify
-    np.testing.assert_array_equal(
-        result_incr.array, [0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
-    )
-    np.testing.assert_array_equal(
-        result_decr.array, [0, 0, 0, 0, 0, 0, 0, 1, 0, 1]
-    )
-    np.testing.assert_array_equal(
-        result_any.array, [0, 0, 0, 1, 0, 0, 0, 1, 0, 1]
-    )
+    np.testing.assert_array_equal(result_incr.array, [0, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+    np.testing.assert_array_equal(result_decr.array, [0, 0, 0, 0, 0, 0, 0, 1, 0, 1])
+    np.testing.assert_array_equal(result_any.array, [0, 0, 0, 1, 0, 0, 0, 1, 0, 1])
 
     # Cleanup - none necessary
 
@@ -388,9 +376,7 @@ def test_flag_jumps_raises_error_for_strict_no_arg_dicts(timeseries_dataframe):
 
     # Exercise
     with pytest.raises(JanitorError) as error_info:
-        df.flag_jumps(
-            scale="absolute", direction="any", threshold=0, strict=True
-        )
+        df.flag_jumps(scale="absolute", direction="any", threshold=0, strict=True)
 
     # Verify
     assert str(error_info.value) == expected_error_msg
@@ -425,7 +411,7 @@ def test_flag_jumps_default_args(timeseries_dataframe):
 
 
 @pytest.mark.timeseries
-def test_flag_jumps_all_args_specifed_as_non_dict(timeseries_dataframe):
+def test_flag_jumps_all_args_specified_as_non_dict(timeseries_dataframe):
     """Test provided kwargs (not of type dict) behave as expected."""
     # Setup
     df = timeseries_dataframe
@@ -617,9 +603,7 @@ def test_flag_jumps_on_issue_provided_use_case():
     expected_df = pd.DataFrame(expected, columns=expected_cols, index=df.index)
 
     # Exercise
-    result = df.flag_jumps(
-        scale="absolute", direction="increasing", threshold=2
-    )
+    result = df.flag_jumps(scale="absolute", direction="increasing", threshold=2)
 
     # Verify
     assert list(result.columns) == list(orig_cols) + expected_cols
